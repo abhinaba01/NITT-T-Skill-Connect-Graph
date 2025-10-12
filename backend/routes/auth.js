@@ -1,100 +1,85 @@
 const express = require('express');
 const router = express.Router();
-const driver = require('../config/neo4j');
+// Import the model instead of the driver
+const graphModel = require('../models/graphModel'); 
 const { hashPassword, comparePassword } = require('../utils/hash');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
 
-// Register route
+// Register route - NOW USES THE MODEL
 router.post('/register', async (req, res) => {
-  const { name, email, password, role } = req.body;
-  if (!name || !email || !password || !role) {
-    return res.status(400).json({ error: 'name, email, password and role are required' });
-  }
-
-  const session = driver.session();
-  try {
-    // Check if user exists
-    const check = await session.run(
-      'MATCH (u {email: $email}) RETURN u LIMIT 1',
-      { email }
-    );
-    if (check.records.length > 0) {
-      return res.status(409).json({ error: 'User with this email already exists' });
+    const { name, email, password, role } = req.body;
+    if (!name || !email || !password || !role) {
+        return res.status(400).json({ error: 'name, email, password and role are required' });
     }
 
-    const pwHash = await hashPassword(password);
-    const label = role.charAt(0).toUpperCase() + role.slice(1).toLowerCase(); // Faculty, Student, Staff, Alumni
+    try {
+        // Step 1: Check if user exists using the model
+        const existingUser = await graphModel.findUserByEmail(email);
+        if (existingUser) {
+            return res.status(409).json({ error: 'User with this email already exists' });
+        }
 
-    const result = await session.run(
-      `CREATE (u:${label} {name: $name, email: $email, password: $password}) RETURN u`,
-      { name, email, password: pwHash }
-    );
+        const pwHash = await hashPassword(password);
+        const label = role.charAt(0).toUpperCase() + role.slice(1).toLowerCase();
 
-    const created = result.records[0].get('u').properties;
-    res.json({ id: created.email, name: created.name, email: created.email, role: label });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  } finally {
-    await session.close();
-  }
+        // Step 2: Create the new user using the model
+        const createdUser = await graphModel.createNode(label, { name, email, password: pwHash });
+
+        res.json({ id: createdUser.email, name: createdUser.name, email: createdUser.email, role: label });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Server error during registration' });
+    }
 });
 
-// Login route
+// Login route - NOW USES THE MODEL
 router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
-  const session = driver.session();
-  try {
-    const result = await session.run(
-      'MATCH (u {email: $email}) RETURN labels(u) AS labels, u.password AS password, u.name AS name LIMIT 1',
-      { email }
-    );
-    if (result.records.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+    try {
+        // Step 1: Find the user by email using the model
+        const user = await graphModel.findUserByEmail(email);
+        if (!user) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        // Step 2: Compare passwords
+        const ok = await comparePassword(password, user.password);
+        if (!ok) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        // Step 3: Sign the token
+        const payload = { email: user.email, name: user.name, role: user.role };
+        const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
+
+        res.json({ token, user: payload });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Server error during login' });
     }
-
-    const record = result.records[0];
-    const pwHash = record.get('password');
-    const name = record.get('name');
-    const labels = record.get('labels');
-    const role = labels && labels.length ? labels[0] : 'User';
-
-    const ok = await comparePassword(password, pwHash);
-    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-
-    const token = jwt.sign({ email, name, role }, JWT_SECRET, { expiresIn: '8h' });
-    res.json({ token, user: { email, name, role } });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  } finally {
-    await session.close();
-  }
 });
 
-// Protected endpoint: get me
+// Protected endpoint: get me - NOW USES THE MODEL
 const auth = require('../middleware/auth');
 router.get('/me', auth, async (req, res) => {
-  // req.user is set by auth middleware
-  const { email } = req.user;
-  const session = driver.session();
-  try {
-    const result = await session.run('MATCH (u {email: $email}) RETURN u, labels(u) AS labels LIMIT 1', { email });
-    if (result.records.length === 0) return res.status(404).json({ error: 'User not found' });
-    const node = result.records[0].get('u').properties;
-    const labels = result.records[0].get('labels');
-    res.json({ user: { email: node.email, name: node.name, role: labels[0] } });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  } finally {
-    await session.close();
-  }
+    // req.user is set by auth middleware
+    const { email } = req.user;
+    try {
+        const user = await graphModel.findUserByEmail(email);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        // Exclude password from the response
+        res.json({ user: { email: user.email, name: user.name, role: user.role } });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 module.exports = router;
